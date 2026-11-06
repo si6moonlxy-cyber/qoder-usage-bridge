@@ -1,5 +1,7 @@
 # qoder-usage-bridge
 
+简体中文 | [English](README_EN.md)
+
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)]()
@@ -186,41 +188,12 @@ python qoder_usage_bridge.py --watch
 qoder-usage-bridge/
 ├── qoder_usage_bridge.py   # 主脚本，单文件，无依赖
 ├── install-task.ps1        # Windows 计划任务安装 / 卸载
-├── README.md
+├── README.md               # 简体中文（本文件）
+├── README_EN.md            # English
 ├── LICENSE                 # MIT
 ├── .gitignore
 └── .gitattributes          # 统一换行符，避免幽灵 diff
 ```
-
-## English
-
-CC Switch's usage dashboard only tracks its built-in apps. Qoder is not one of them, and CC Switch exposes no hook for external producers. This script bridges Qoder's local token usage into CC Switch:
-
-- reads `chat_message.token_info` from Qoder's SQLite database (read-only)
-- resolves the real model name and vendor from Qoder's VS Code-style state databases
-- prices each request with CC Switch's `model_pricing` table
-- upserts rows into `proxy_request_logs` with `data_source='qoder_session'`
-
-```bash
-python qoder_usage_bridge.py            # dry run
-python qoder_usage_bridge.py --apply    # write (auto backup)
-python qoder_usage_bridge.py --watch    # keep in sync every 60 seconds
-python qoder_usage_bridge.py --list     # inspect imported rows
-python qoder_usage_bridge.py --reset    # remove imported rows
-```
-
-CC Switch offers no hook for external scripts, so the recommended setup is a per-user Windows scheduled task that runs the bridge every minute (no admin rights, no resident process):
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\install-task.ps1
-powershell -ExecutionPolicy Bypass -File .\install-task.ps1 -Uninstall
-```
-
-Only rows tagged `data_source='qoder_session'` are touched. Qoder's database is opened read-only. Backups go to `~/.cc-switch/backups/qoder-import-<timestamp>/`, at most once per hour, keeping the five newest.
-
-Known limits: no latency data (Qoder does not store it), historical usage is limited to the current Qoder database, and prices for Qoder's bundled models are estimates from CC Switch's price table.
-
-Unofficial project, not affiliated with Qoder or CC Switch. Back up before trying.
 
 ## License
 
