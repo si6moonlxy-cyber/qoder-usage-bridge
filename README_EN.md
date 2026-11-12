@@ -1,6 +1,6 @@
 # qoder-usage-bridge
 
-English | [简体中文](README.md)
+English | [简体中文](README.md) | [Changelog](CHANGELOG.md)
 
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
