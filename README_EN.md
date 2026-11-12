@@ -100,7 +100,16 @@ Then go back to CC Switch's usage dashboard and hit refresh. There is no Qoder i
 | `--debounce` | Delay after detecting a change before syncing, 3 seconds by default |
 | `--log` | Log file path |
 | `--quiet` | Do not print to stdout; log to file instead |
+| `--ledger` | Ledger path; defaults to `%LOCALAPPDATA%\qoder-usage-bridge\qoder-ledger.db` |
+| `--no-ledger` | Skip the ledger for this run |
+| `--snapshot-dir` | Daily snapshot directory; defaults to `snapshots\` next to the ledger |
+| `--no-snapshot` | Skip the daily snapshot for this run |
+| `--snapshot-keep` | How many dated snapshots to keep, 14 by default |
+| `--snapshot-full` | Also copy Qoder's whole `local.db` daily (about 45 MB per day) |
 | `--list` | Print imported rows |
+| `--report` | Print monthly totals from the ledger (`--month` optional) |
+| `--month` | `YYYY-MM`, used by `--report` and `--restore-from-ledger` |
+| `--restore-from-ledger` | Replay the ledger into `cc-switch.db` |
 | `--reset` | Delete every imported Qoder row |
 | `--version` | Print the version |
 
@@ -122,6 +131,7 @@ powershell -ExecutionPolicy Bypass -File .\install-task.ps1 -Uninstall
 - It runs silently as `pythonw.exe --apply --allow-running --quiet`, so no window appears
 - Child processes spawned by the script (such as `tasklist`) use `CREATE_NO_WINDOW`, so nothing flashes and focus is never stolen
 - Log file: `%LOCALAPPDATA%\qoder-usage-bridge\bridge.log` (rotated past 5 MB)
+- Each run also appends to the ledger and writes one snapshot per day (see "History that survives a Qoder rebuild"), so a rebuild can be replayed
 - Backups happen at most once per hour, keeping the five newest, so a per-minute task cannot flood the disk
 
 Then set the usage dashboard refresh interval to 1 minute in CC Switch (the `usageDashboardRefreshIntervalMs` key in `settings.json`); the panel refreshes itself and looks indistinguishable from the built-in statistics.
@@ -135,6 +145,41 @@ python qoder_usage_bridge.py --watch
 - Heartbeat sync every 60 seconds (`--interval` configurable)
 - As soon as Qoder writes to its database, the change is picked up within seconds (`--debounce` configurable)
 - Best when you want the freshest data and do not mind one extra background process
+
+## History that survives a Qoder rebuild
+
+Upgrading Qoder may recreate `local.db`, and a recreation **physically deletes** the old conversations (measured: only post-rebuild records remain, and not even free pages hold leftovers). Relying on Qoder's database alone therefore loses that history for good. Every sync also copies the records into the script's own ledger:
+
+```
+Qoder local.db (read-only)
+      │
+      ├─→ ledger %LOCALAPPDATA%\qoder-usage-bridge\qoder-ledger.db   appended, deduped by message id
+      │        └─→ daily snapshot snapshots\qoder-ledger-YYYYMMDD.db   one file per day, 14 kept
+      │
+      └─→ cc-switch.db (app_type=qoder, data_source=qoder_session)
+```
+
+- The ledger is **one continuously appended SQLite file**, not a new file per day: it dedupes by `message id` and only grows when new messages arrive. Today 493 rows take **120 KB** and less than 10 ms to write.
+- A snapshot is **a new dated file per day**, a copy of the ledger rather than of Qoder's database — also about 120 KB each, 14 kept with rolling deletion, and re-running on the same day does not rewrite it.
+- The ledger stores **raw token counts** (prompt / cached / completion) plus the resolved model and vendor, so a rebuilt Qoder database cannot take the usage away: rows can always be replayed into CC Switch.
+- To keep Qoder's whole database as well (for example to restore full conversations), add `--snapshot-full`: one extra `local.db` copy per day, about 45 MB/day, roughly 640 MB for 14 copies. Usually unnecessary — most of those 40 MB are Qoder's memory and embedding tables, unrelated to usage.
+- Qoder's database is always opened with `mode=ro`; the script **never** writes to it.
+
+### Querying and replaying
+
+```bash
+# Monthly totals from the ledger (still works after Qoder rebuilt its database)
+python qoder_usage_bridge.py --report
+python qoder_usage_bridge.py --report --month 2026-10
+
+# Replay the ledger into CC Switch (after Qoder dropped history, or CC Switch pruned it)
+python qoder_usage_bridge.py --restore-from-ledger --allow-running
+python qoder_usage_bridge.py --restore-from-ledger --allow-running --month 2026-10
+```
+
+Replay upserts by `request_id`, so running it twice never doubles anything; `--reset` only removes rows from CC Switch and leaves the ledger alone.
+
+> The ledger starts accumulating only from the version that introduced it. Months already erased by a Qoder rebuild before that point have no local backup source — use the usage page of your Qoder account, which is server-side.
 
 ## How models and vendors are resolved
 
@@ -164,9 +209,15 @@ If the table layout changes, the script will need a matching update. Because row
 **Does the scheduled task pop up windows or flash a black box?**
 No. The task runs under `pythonw.exe` and its child processes use `CREATE_NO_WINDOW`, so there is no window at any point.
 
+**Can the ledger fill the disk?**
+No. It is a single file that only appends unseen messages: 493 rows are about 120 KB today, and even heavy monthly use stays in the hundreds of KB to a few MB. Daily snapshots are 120 KB each with 14 kept, about 2 MB in total. Only opting into `--snapshot-full` grows at 45 MB per day.
+
+**Can history be recovered after Qoder recreates its database?**
+Yes, provided the ledger already held those records when the rebuild happened (the scheduled task syncs every minute, so it normally does). Replay with `--restore-from-ledger`, and `--report` reads the same ledger for monthly totals.
+
 ## Known limitations
 
-- Upgrading Qoder recreates its local database, so history only reaches back to the day of the last recreation
+- Upgrading Qoder recreates its local database: the ledger (since 1.1.0) keeps everything recorded from then on, but months lost before that cannot be recovered
 - "Speed" and "first token" stay empty: Qoder does not store latency data locally
 - Prices for Qoder's bundled models come from CC Switch's price table; they are estimates, not the credits Qoder actually deducts
 - The app filter has no Qoder icon (the app list is built into CC Switch)
@@ -176,9 +227,10 @@ No. The task runs under `pythonw.exe` and its child processes use `CREATE_NO_WIN
 ## Safety and rollback
 
 - Qoder's database is always opened read-only (`mode=ro`)
+- The ledger and its snapshots live under `%LOCALAPPDATA%\qoder-usage-bridge\`; nothing in Qoder's tree is touched
 - Before writing, `~/.cc-switch/cc-switch.db` is backed up to `~/.cc-switch/backups/qoder-import-<timestamp>/`, at most once per hour, keeping the five newest
 - Only rows with `data_source='qoder_session'` are written, and `--reset` deletes only those rows
-- If anything goes wrong, restore the backup over the database
+- If anything goes wrong, restore the backup over the database; history can also be regenerated with `--restore-from-ledger`
 
 ## Repository layout
 

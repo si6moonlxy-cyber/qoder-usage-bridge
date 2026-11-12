@@ -13,12 +13,21 @@ Only rows tagged ``data_source='qoder_session'`` are ever written or removed;
 every other application's data is left untouched. Qoder's database is always
 opened read-only. ``cc-switch.db`` is backed up before the first write.
 
+Every record is also appended to a durable local ledger (one SQLite file, keyed
+by Qoder's message id). Qoder rebuilds ``local.db`` on upgrade and physically
+drops the old conversations, so without the ledger the history is gone for good;
+with it, a rebuild can be replayed. A dated copy of the ledger is written once a
+day, and ``--snapshot-full`` additionally copies the whole Qoder database.
+
 Usage:
     python qoder_usage_bridge.py                     # dry run, prints what would be written
     python qoder_usage_bridge.py --apply             # one-shot import (backs up first)
     python qoder_usage_bridge.py --apply --allow-running
     python qoder_usage_bridge.py --watch             # keep in sync every 60s (daemon)
     python qoder_usage_bridge.py --list              # show what has been imported
+    python qoder_usage_bridge.py --report            # monthly totals from the ledger
+    python qoder_usage_bridge.py --report --month 2026-10
+    python qoder_usage_bridge.py --restore-from-ledger   # replay the ledger into CC Switch
     python qoder_usage_bridge.py --reset             # delete imported Qoder rows
 
 Author: qoder-usage-bridge contributors
@@ -39,7 +48,7 @@ import sys
 import time
 from collections import defaultdict
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 APP_TYPE = "qoder"
 DATA_SOURCE = "qoder_session"
@@ -49,6 +58,10 @@ LOG_MAX_BYTES = 5 * 1024 * 1024
 BACKUP_KEEP = 5
 BACKUP_REUSE_SECONDS = 3600
 CREATE_NO_WINDOW = 0x08000000
+LEDGER_FILENAME = "qoder-ledger.db"
+LEDGER_SNAPSHOT_PREFIX = "qoder-ledger-"
+RAW_SNAPSHOT_PREFIX = "qoder-raw-"
+SNAPSHOT_KEEP = 14
 
 # Qoder's built-in model table only carries a display name, so infer the model
 # vendor from it. Order matters: the first matching prefix wins.
@@ -92,6 +105,20 @@ def default_ccs_db() -> str:
 def default_log_path() -> str:
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/.cache")
     return os.path.join(base, "qoder-usage-bridge", "bridge.log")
+
+
+def default_state_dir() -> str:
+    """Directory holding the ledger and its snapshots (never inside Qoder's tree)."""
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "qoder-usage-bridge")
+
+
+def default_ledger_path() -> str:
+    return os.path.join(default_state_dir(), LEDGER_FILENAME)
+
+
+def default_snapshot_dir() -> str:
+    return os.path.join(default_state_dir(), "snapshots")
 
 
 # --------------------------------------------------------------------------- logging
@@ -266,18 +293,222 @@ def read_qoder_records(db_path: str, ctx: dict) -> list[dict]:
         info = resolve_model(session_id, model_key, ctx)
         records.append(
             {
+                "message_id": str(msg_id),
                 "request_id": ID_PREFIX + str(msg_id),
                 "session_id": session_id,
                 "model": info["display"],
                 "model_id": info["model_id"],
                 "provider": info["provider"],
+                "prompt_tokens": prompt,
+                "cached_tokens": cached,
+                "completion_tokens": output,
                 "input_tokens": prompt - cached,
                 "cache_read_tokens": cached,
                 "output_tokens": output,
+                "created_at_ms": int(gmt_create),
                 "created_at": int(int(gmt_create) // 1000),
             }
         )
     return records
+
+
+# --------------------------------------------------------------------------- durable ledger
+
+
+LEDGER_SCHEMA = """
+create table if not exists qoder_usage (
+    message_id text primary key,
+    session_id text,
+    created_at_ms integer not null,
+    prompt_tokens integer not null default 0,
+    cached_tokens integer not null default 0,
+    completion_tokens integer not null default 0,
+    model text,
+    model_id text,
+    provider text,
+    first_seen_at integer not null
+);
+create index if not exists qoder_usage_created_at on qoder_usage(created_at_ms);
+"""
+
+
+def open_ledger(path: str) -> sqlite3.Connection:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    con = sqlite3.connect(path, timeout=15)
+    con.executescript(LEDGER_SCHEMA)
+    con.commit()
+    return con
+
+
+def ledger_append(con: sqlite3.Connection, records: list[dict]) -> int:
+    """Append records to the ledger, ignoring ids already stored.
+
+    This is the only copy of the usage that survives a Qoder database rebuild, so
+    it keeps the raw token counts: derived fields can be recomputed, raw cannot.
+    """
+    now = int(time.time())
+    added = 0
+    for rec in records:
+        cur = con.execute(
+            """
+            insert or ignore into qoder_usage (
+                message_id, session_id, created_at_ms, prompt_tokens, cached_tokens,
+                completion_tokens, model, model_id, provider, first_seen_at
+            ) values (?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                rec["message_id"],
+                rec["session_id"],
+                rec["created_at_ms"],
+                rec["prompt_tokens"],
+                rec["cached_tokens"],
+                rec["completion_tokens"],
+                rec["model"],
+                rec["model_id"],
+                rec["provider"],
+                now,
+            ),
+        )
+        if cur.rowcount and cur.rowcount > 0:
+            added += 1
+    con.commit()
+    return added
+
+
+def ledger_records(ledger_path: str, month: str | None = None) -> list[dict]:
+    """Rebuild import records from the ledger (used to replay a lost Qoder history)."""
+    con = sqlite3.connect(f"file:{ledger_path}?mode=ro", uri=True)
+    try:
+        sql = (
+            "select message_id, session_id, created_at_ms, prompt_tokens, cached_tokens, "
+            "completion_tokens, model, model_id, provider from qoder_usage"
+        )
+        params: tuple = ()
+        if month:
+            sql += " where strftime('%Y-%m', created_at_ms/1000, 'unixepoch', 'localtime') = ?"
+            params = (month,)
+        sql += " order by created_at_ms"
+        rows = con.execute(sql, params).fetchall()
+    finally:
+        con.close()
+
+    records = []
+    for msg_id, session_id, created_at_ms, prompt, cached, completion, model, model_id, provider in rows:
+        records.append(
+            {
+                "message_id": msg_id,
+                "request_id": ID_PREFIX + msg_id,
+                "session_id": session_id,
+                "model": model or "unknown",
+                "model_id": model_id or "",
+                "provider": provider or FALLBACK_PROVIDER,
+                "prompt_tokens": prompt,
+                "cached_tokens": cached,
+                "completion_tokens": completion,
+                "input_tokens": max(prompt - cached, 0),
+                "cache_read_tokens": cached,
+                "output_tokens": completion,
+                "created_at_ms": created_at_ms,
+                "created_at": int(created_at_ms // 1000),
+            }
+        )
+    return records
+
+
+def prune_entries(directory: str, prefix: str, keep: int) -> None:
+    """Drop the oldest dated entries beyond ``keep`` (files or directories)."""
+    if keep <= 0:
+        return
+    try:
+        names = sorted(name for name in os.listdir(directory) if name.startswith(prefix))
+    except OSError:
+        return
+    for stale in names[: max(0, len(names) - keep)]:
+        path = os.path.join(directory, stale)
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def snapshot_ledger(ledger_path: str, snapshot_dir: str, keep: int) -> tuple[str | None, bool]:
+    """Copy the ledger to ``<snapshot_dir>/qoder-ledger-YYYYMMDD.db`` once per day."""
+    if not os.path.exists(ledger_path):
+        return None, False
+    os.makedirs(snapshot_dir, exist_ok=True)
+    target = os.path.join(snapshot_dir, LEDGER_SNAPSHOT_PREFIX + dt.date.today().strftime("%Y%m%d") + ".db")
+    if os.path.exists(target):
+        return target, False
+
+    tmp = target + ".tmp"
+    src = sqlite3.connect(f"file:{ledger_path}?mode=ro", uri=True)
+    try:
+        dst = sqlite3.connect(tmp)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    os.replace(tmp, target)
+    prune_entries(snapshot_dir, LEDGER_SNAPSHOT_PREFIX, keep)
+    return target, True
+
+
+def snapshot_raw(qoder_db: str, snapshot_dir: str, keep: int) -> tuple[str | None, bool]:
+    """Optional full copy of Qoder's database (large: tens of MB per day)."""
+    if not os.path.exists(qoder_db):
+        return None, False
+    os.makedirs(snapshot_dir, exist_ok=True)
+    target = os.path.join(snapshot_dir, RAW_SNAPSHOT_PREFIX + dt.date.today().strftime("%Y%m%d"))
+    if os.path.isdir(target):
+        return target, False
+    os.makedirs(target, exist_ok=True)
+    for suffix in ("", "-wal", "-shm"):
+        src = qoder_db + suffix
+        if os.path.exists(src):
+            try:
+                shutil.copy2(src, os.path.join(target, os.path.basename(qoder_db) + suffix))
+            except OSError as exc:
+                log(f"raw snapshot: skipped {os.path.basename(src)} ({exc})")
+    prune_entries(snapshot_dir, RAW_SNAPSHOT_PREFIX, keep)
+    return target, True
+
+
+def persist(records: list[dict], opts: argparse.Namespace) -> tuple[int, list[str]]:
+    """Write the durable ledger and (at most once a day) its dated snapshot."""
+    notes: list[str] = []
+    added = 0
+    if not opts.no_ledger:
+        try:
+            con = open_ledger(opts.ledger)
+            try:
+                added = ledger_append(con, records)
+            finally:
+                con.close()
+        except (sqlite3.Error, OSError) as exc:
+            notes.append(f"ledger skipped: {type(exc).__name__}: {exc}")
+
+    if not opts.no_snapshot and not opts.no_ledger:
+        try:
+            path, created = snapshot_ledger(opts.ledger, opts.snapshot_dir, opts.snapshot_keep)
+            if created:
+                notes.append(f"ledger snapshot: {path}")
+        except (sqlite3.Error, OSError) as exc:
+            notes.append(f"ledger snapshot skipped: {type(exc).__name__}: {exc}")
+        if opts.snapshot_full:
+            try:
+                path, created = snapshot_raw(opts.qoder_db, opts.snapshot_dir, opts.snapshot_keep)
+                if created:
+                    notes.append(f"raw snapshot: {path}")
+            except OSError as exc:
+                notes.append(f"raw snapshot skipped: {type(exc).__name__}: {exc}")
+    return added, notes
 
 
 # --------------------------------------------------------------------------- cc-switch side
@@ -475,14 +706,17 @@ def summarize(records: list[dict], imported: set[str]) -> None:
     log("Models: " + ", ".join(f"{name}={count}" for name, count in sorted(models.items(), key=lambda kv: -kv[1])))
 
 
-def import_once(qoder_db: str, ccs_db: str) -> tuple[int, int]:
+def import_once(qoder_db: str, ccs_db: str, opts: argparse.Namespace) -> tuple[int, int, int, list[str]]:
+    """One sync pass: Qoder -> ledger (+ snapshot) -> cc-switch.db."""
     ctx = load_model_context()
     records = read_qoder_records(qoder_db, ctx)
+    added, notes = persist(records, opts)
     con = open_ccs(ccs_db)
     try:
-        return upsert_records(con, records)
+        handled, priced = upsert_records(con, records)
     finally:
         con.close()
+    return handled, priced, added, notes
 
 
 def cmd_list(ccs_db: str) -> None:
@@ -526,12 +760,96 @@ def cmd_reset(ccs_db: str, allow_running: bool) -> int:
     return 0
 
 
-def cmd_watch(qoder_db: str, ccs_db: str, interval: float, poll: float, debounce: float) -> int:
+def cmd_report(ledger_path: str, month: str | None) -> int:
+    """Monthly totals from the durable ledger (works even after Qoder rebuilt its database)."""
+    if not os.path.exists(ledger_path):
+        log(f"No ledger yet: {ledger_path}")
+        log("Run --apply once (or let the scheduled task run) to start recording.")
+        return 0
+
+    where = ""
+    params: tuple = ()
+    if month:
+        where = " where strftime('%Y-%m', created_at_ms/1000, 'unixepoch', 'localtime') = ?"
+        params = (month,)
+
+    con = sqlite3.connect(f"file:{ledger_path}?mode=ro", uri=True)
+    try:
+        months = con.execute(
+            "select strftime('%Y-%m', created_at_ms/1000, 'unixepoch', 'localtime') m,"
+            " count(*), sum(prompt_tokens), sum(cached_tokens), sum(completion_tokens)"
+            " from qoder_usage" + where + " group by m order by m",
+            params,
+        ).fetchall()
+        models = con.execute(
+            "select model, count(*), sum(prompt_tokens), sum(cached_tokens), sum(completion_tokens)"
+            " from qoder_usage" + where + " group by model order by 2 desc",
+            params,
+        ).fetchall()
+        total = con.execute("select count(*) from qoder_usage").fetchone()[0]
+    finally:
+        con.close()
+
+    if not months:
+        log(f"No ledger rows for {month or 'any month'} (ledger holds {total} rows).")
+        return 0
+
+    log(f"Ledger: {ledger_path}  (total {total} rows)")
+    for m, count, prompt, cached, completion in months:
+        prompt, cached, completion = prompt or 0, cached or 0, completion or 0
+        fresh = max(prompt - cached, 0)
+        log(
+            f"  {m}  requests {count:5d}  prompt {prompt:>12,}  cached {cached:>12,}  "
+            f"completion {completion:>10,}  fresh {fresh:>11,}  real {fresh + completion:>11,}"
+        )
+
+    log("By model:")
+    for model, count, prompt, cached, completion in models:
+        prompt, cached, completion = prompt or 0, cached or 0, completion or 0
+        fresh = max(prompt - cached, 0)
+        log(
+            f"  {str(model or 'unknown')[:24]:24}  requests {count:5d}  "
+            f"fresh {fresh:>11,}  cached {cached:>12,}  completion {completion:>10,}"
+        )
+    log("real = fresh input + completion (cache hits excluded)")
+    return 0
+
+
+def cmd_restore(ledger_path: str, ccs_db: str, allow_running: bool, month: str | None) -> int:
+    """Replay the ledger into cc-switch.db (after Qoder dropped or CC Switch pruned the rows)."""
+    if not os.path.exists(ledger_path):
+        log(f"No ledger yet: {ledger_path}")
+        return 1
+    records = ledger_records(ledger_path, month)
+    if not records:
+        log(f"Ledger has no rows{(' for ' + month) if month else ''}: {ledger_path}")
+        return 0
+    log(f"Ledger rows to restore: {len(records)}{(' (' + month + ')') if month else ''}")
+    if not allow_running and app_running():
+        log("CC Switch is running. Close it first, or pass --allow-running.")
+        return 2
+
+    log(f"Backup: {backup_db(ccs_db)}")
+    con = open_ccs(ccs_db)
+    try:
+        handled, priced = upsert_records(con, records)
+    finally:
+        con.close()
+    log(f"Restored: {handled} Qoder rows written, {priced} matched a price.")
+    log("Refresh the usage dashboard in CC Switch to see them.")
+    return 0
+
+
+def cmd_watch(opts: argparse.Namespace) -> int:
     """Keep Qoder in sync: heartbeat every ``interval`` seconds, plus near-real-time
     pickup when Qoder writes to its database."""
+    qoder_db, ccs_db = opts.qoder_db, opts.ccswitch_db
+    interval, poll, debounce = opts.interval, opts.poll, opts.debounce
     log(f"[watch] started (version {__version__}, interval {interval:.0f}s, poll {poll:.0f}s)")
     log(f"[watch] qoder : {qoder_db}")
     log(f"[watch] ccswitch: {ccs_db}")
+    if not opts.no_ledger:
+        log(f"[watch] ledger : {opts.ledger}" + ("  (+ daily snapshot)" if not opts.no_snapshot else ""))
 
     backup_done = False
     last_import = 0.0
@@ -557,11 +875,13 @@ def cmd_watch(qoder_db: str, ccs_db: str, interval: float, poll: float, debounce
                 if not backup_done:
                     log(f"[watch] backup: {backup_db(ccs_db)}")
                     backup_done = True
-                handled, priced = import_once(qoder_db, ccs_db)
+                handled, priced, added, notes = import_once(qoder_db, ccs_db, opts)
                 last_import = time.time()
                 changed_at = None
                 reason = "change" if due_change else "heartbeat"
-                log(f"[watch] synced ({reason}): {handled} rows, {priced} priced")
+                log(f"[watch] synced ({reason}): {handled} rows, {priced} priced, {added} new in ledger")
+                for note in notes:
+                    log(f"[watch] {note}")
         except KeyboardInterrupt:
             log("[watch] stopped")
             return 0
@@ -596,7 +916,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--debounce", type=float, default=3, help="wait after a database change before syncing")
     parser.add_argument("--log", default=None, help="log file path (default: %%LOCALAPPDATA%% log in watch mode)")
     parser.add_argument("--quiet", action="store_true", help="do not print to stdout (watch mode)")
+    parser.add_argument("--ledger", default=default_ledger_path(), help="durable ledger path (one file, appended)")
+    parser.add_argument("--no-ledger", action="store_true", help="do not record to the ledger")
+    parser.add_argument("--snapshot-dir", default=default_snapshot_dir(), help="daily snapshot directory")
+    parser.add_argument("--no-snapshot", action="store_true", help="do not write the daily snapshot")
+    parser.add_argument("--snapshot-keep", type=int, default=SNAPSHOT_KEEP, help="how many dated snapshots to keep")
+    parser.add_argument(
+        "--snapshot-full",
+        action="store_true",
+        help="also copy Qoder's whole database daily (tens of MB per day)",
+    )
     parser.add_argument("--list", action="store_true", help="show imported rows")
+    parser.add_argument("--report", action="store_true", help="monthly totals from the ledger")
+    parser.add_argument("--month", default=None, help="YYYY-MM filter for --report / --restore-from-ledger")
+    parser.add_argument("--restore-from-ledger", action="store_true", help="replay the ledger into cc-switch.db")
     parser.add_argument("--reset", action="store_true", help="delete imported Qoder rows")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = parser.parse_args(argv)
@@ -610,12 +943,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.list:
         cmd_list(args.ccswitch_db)
         return 0
+    if args.report:
+        return cmd_report(args.ledger, args.month)
+    if args.restore_from_ledger:
+        return cmd_restore(args.ledger, args.ccswitch_db, args.allow_running, args.month)
     if args.reset:
         return cmd_reset(args.ccswitch_db, args.allow_running)
 
     if args.watch:
         try:
-            return cmd_watch(args.qoder_db, args.ccswitch_db, args.interval, args.poll, args.debounce)
+            return cmd_watch(args)
         except KeyboardInterrupt:
             log("[watch] stopped by user")
             return 0
@@ -626,11 +963,18 @@ def main(argv: list[str] | None = None) -> int:
     try:
         summarize(records, existing_ids(con))
         if not args.apply:
-            log("\nDry run, nothing written. Re-run with --apply to write.")
+            log(f"\nLedger: {args.ledger}" + (" (disabled)" if args.no_ledger else ""))
+            log("Dry run, nothing written. Re-run with --apply to write.")
             return 0
         if not args.allow_running and app_running():
             log("\nCC Switch is running. Close it first, or pass --allow-running.")
             return 2
+
+        added, notes = persist(records, args)
+        for note in notes:
+            log(note)
+        if not args.no_ledger:
+            log(f"Ledger: {added} new rows appended to {args.ledger}")
 
         log(f"\nBackup: {backup_db(args.ccswitch_db)}")
         handled, priced = upsert_records(con, records)

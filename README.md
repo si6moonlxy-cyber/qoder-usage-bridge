@@ -102,7 +102,16 @@ python qoder_usage_bridge.py --reset
 | `--debounce` | 检测到变更后等待时间，默认 3 秒 |
 | `--log` | 日志文件路径 |
 | `--quiet` | 不打印到 stdout，自动落日志 |
+| `--ledger` | 账本路径，默认 `%LOCALAPPDATA%\qoder-usage-bridge\qoder-ledger.db` |
+| `--no-ledger` | 本次不写账本 |
+| `--snapshot-dir` | 每日快照目录，默认账本同级的 `snapshots\` |
+| `--no-snapshot` | 本次不写快照 |
+| `--snapshot-keep` | 保留多少份快照，默认 14 |
+| `--snapshot-full` | 额外每天整库拷一份 Qoder 的 `local.db`（约 45 MB/天） |
 | `--list` | 打印已导入行 |
+| `--report` | 按账本打印月度用量，可配 `--month` |
+| `--month` | `YYYY-MM`，用于 `--report` / `--restore-from-ledger` |
+| `--restore-from-ledger` | 把账本回放进 `cc-switch.db` |
 | `--reset` | 删除所有已导入的 Qoder 行 |
 | `--version` | 版本号 |
 
@@ -124,6 +133,7 @@ powershell -ExecutionPolicy Bypass -File .\install-task.ps1 -Uninstall
 - 以 `pythonw.exe --apply --allow-running --quiet` 静默运行，不弹窗
 - 脚本内部调用外部命令（如 `tasklist`）时加了 `CREATE_NO_WINDOW`，不闪黑框、不抢焦点
 - 日志：`%LOCALAPPDATA%\qoder-usage-bridge\bridge.log`（超过 5MB 自动轮转）
+- 每次运行顺带写账本、每天写一份快照（见下文「历史留底」），所以 Qoder 重建库也能回放
 - 备份最多每小时一次、只保留最近 5 份，不会被每分钟的任务塞满磁盘
 
 再在 CC Switch 设置里把用量面板的刷新间隔调成 1 分钟（对应 `settings.json` 的 `usageDashboardRefreshIntervalMs`），面板就会自己滚动刷新，观感上和内置统计没有区别。
@@ -137,6 +147,41 @@ python qoder_usage_bridge.py --watch
 - 每 60 秒心跳同步一次（`--interval` 可调）
 - Qoder 数据库一有写入，几秒内立即补同步（`--debounce` 可调）
 - 适合想第一时间看到数据、且不介意多一个后台进程的场景
+
+## 历史留底：账本与每日快照
+
+Qoder 升级时可能重建 `local.db`，重建会把旧会话**物理删除**（实测：库里只剩重建之后的记录，连空闲页里都扫不出残留）。只依赖 Qoder 的库，那段历史就永久没了。所以脚本每次同步会顺手把记录抄进自己的账本：
+
+```
+Qoder local.db（只读）
+      │
+      ├─→ 账本 %LOCALAPPDATA%\qoder-usage-bridge\qoder-ledger.db   持续追加，按 message id 去重
+      │        └─→ 每日快照 snapshots\qoder-ledger-YYYYMMDD.db       每天一份，默认留 14 份
+      │
+      └─→ cc-switch.db（app_type=qoder, data_source=qoder_session）
+```
+
+- 账本是**一个持续追加的 SQLite 文件**（不是每天新开）：按 `message id` 去重，只有新消息才长。现在 493 行占 **120 KB**，写入不到 10 ms。
+- 快照是**每天新开一个文件**：复制的是账本而不是 Qoder 的库，单份同样约 120 KB，默认保留 14 份并滚动删除；同一天重复运行不会重写。
+- 账本存**原始 token 数**（prompt / cached / completion）加上已解析的模型与供应商，所以即使 Qoder 重建、会话上下文全没了，也能还原成 CC Switch 的行。
+- 想连 Qoder 整库一起留底（例如要恢复完整会话内容），加 `--snapshot-full`：每天多拷一份 `local.db`，约 45 MB/天，留 14 份约 640 MB。多数情况用不到——那 40 MB 里绝大部分是 Qoder 的记忆/向量表，跟用量无关。
+- Qoder 的库始终以 `mode=ro` 只读打开，脚本**从不**写它。
+
+### 查历史与回填
+
+```bash
+# 按月看账本里的用量（Qoder 重建之后照样能查）
+python qoder_usage_bridge.py --report
+python qoder_usage_bridge.py --report --month 2026-10
+
+# 把账本回放进 CC Switch（Qoder 丢了历史、或 CC Switch 那边被裁掉之后）
+python qoder_usage_bridge.py --restore-from-ledger --allow-running
+python qoder_usage_bridge.py --restore-from-ledger --allow-running --month 2026-10
+```
+
+回填按 `request_id` 做 upsert，重复执行不会翻倍；`--reset` 只删 CC Switch 里的行，账本不动。
+
+> 账本只能从**装了这个版本之后**开始积累。装之前已经被 Qoder 重建掉的月份，本地没有备份源，只能去 Qoder 账户的服务端用量页查。
 
 ## 模型与供应商是怎么来的
 
@@ -166,9 +211,15 @@ python qoder_usage_bridge.py --watch
 **计划任务会不会弹窗 / 闪黑框？**
 不会。任务用 `pythonw.exe` 运行，子进程也带 `CREATE_NO_WINDOW`，全程无窗口。
 
+**账本会不会把磁盘塞满？**
+不会。账本只有一个文件、只追加新消息：目前 493 行 ≈ 120 KB，一个月重度使用量级也就几百 KB 到几 MB。每日快照每份 120 KB、保留 14 份，合计约 2 MB。只有主动开 `--snapshot-full` 才会按 45 MB/天增长。
+
+**Qoder 升级重建库之后，历史还能救回来吗？**
+能——前提是重建发生时账本里已经有那些记录（计划任务每分钟同步一次，正常不会漏）。用 `--restore-from-ledger` 把账本回填进 CC Switch；`--report` 也能直接查月度用量。
+
 ## 已知限制
 
-- Qoder 升级会重建本地库，历史最多只能追到重建当天
+- Qoder 升级会重建本地库：账本（1.1.0 起）能保住装上新版之后的记录，装之前的月份无法追回
 - 「速度」「首字」为空：Qoder 本地不存时延数据
 - Qoder 内置模型的单价来自 CC Switch 价目表，是估算值，不等于 Qoder 实际扣的积分
 - 应用筛选栏没有 Qoder 图标（应用列表是 CC Switch 内置的）
@@ -178,9 +229,10 @@ python qoder_usage_bridge.py --watch
 ## 安全与回滚
 
 - Qoder 的库始终以 `mode=ro` 只读打开
+- 账本与快照写在 `%LOCALAPPDATA%\qoder-usage-bridge\` 下，不碰 Qoder 的任何文件
 - 写入前备份 `~/.cc-switch/cc-switch.db` 到 `~/.cc-switch/backups/qoder-import-<时间戳>/`，最多每小时一次、保留最近 5 份
 - 只写 `data_source='qoder_session'` 的行，`--reset` 也只删这些行
-- 出问题可直接用备份覆盖回去
+- 出问题可直接用备份覆盖回去；历史数据还能用 `--restore-from-ledger` 重生
 
 ## 目录结构
 
